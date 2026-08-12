@@ -1,185 +1,146 @@
 name: Build Android APK
 
 on:
-  workflow_dispatch:
-    inputs:
-      build_type:
-        description: 'Build type'
-        required: true
-        default: 'debug'
-        type: choice
-        options: [debug, release]
   push:
-    branches: [main]
+    branches: [main, master]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
-  ANDROID_HOME: /opt/android-sdk
-  ANDROID_SDK_ROOT: /opt/android-sdk
-  NDK_VERSION: "25.2.9519653"
-  RUST_VERSION: "1.95"
+  RUST_BACKTRACE: 1
+  # 对齐 Cargo.toml 中的 tauri = "2.7.0"
+  TURI_CLI_VERSION: "2.7.0"
+  NODE_VERSION: "20"
+  PNPM_VERSION: "9"
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  build-android:
+    runs-on: ubuntu-22.04
     timeout-minutes: 180
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          submodules: recursive
 
-      # ─── 安装系统依赖 ───
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev libgtk-3-dev \
-            libayatana-appindicator3-dev librsvg2-dev \
-            libsdl2-dev pkg-config curl wget unzip \
-            openjdk-17-jdk-headless
-
-      # ─── 安装 Rust 1.95 ───
-      - name: Install Rust ${{ env.RUST_VERSION }}
-        uses: dtolnay/rust-toolchain@master
+      # ─── Rust 工具链 ───
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ env.RUST_VERSION }}
+          toolchain: "1.95"
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
 
-      # ─── 设置 Android SDK + NDK ───
-      - name: Setup Android SDK + NDK
-        run: |
-          set -eux
-          SDK=/opt/android-sdk
-          mkdir -p "$SDK/cmdline-tools"
-          cd /tmp
-          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O cmdtools.zip
-          unzip -q cmdtools.zip -d "$SDK/cmdline-tools"
-          mkdir -p "$SDK/cmdline-tools/latest"
-          mv "$SDK/cmdline-tools/cmdline-tools/"* "$SDK/cmdline-tools/latest/"
-          rm -rf "$SDK/cmdline-tools/cmdline-tools"
-          echo "$SDK/cmdline-tools/latest/bin" >> $GITHUB_PATH
-          echo "$SDK/platform-tools" >> $GITHUB_PATH
-          echo "ANDROID_HOME=$SDK" >> $GITHUB_ENV
-          echo "ANDROID_SDK_ROOT=$SDK" >> $GITHUB_ENV
-          export PATH="$SDK/cmdline-tools/latest/bin:$SDK/platform-tools:$PATH"
-          which sdkmanager
-          sdkmanager --version
-
-      - name: Install SDK packages & NDK
-        run: |
-          set -eux
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;${{ env.NDK_VERSION }}"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
-          echo "$ANDROID_HOME/ndk/${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
-
-      # ─── Rust 缓存 ───
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
-            . -> target
-            easytier-gui/src-tauri -> easytier-gui/src-tauri/target
+            ./easytier-gui/src-tauri
+          key: android-2.7.0-${{ hashFiles('**/Cargo.lock') }}
 
-      # ─── Node.js + pnpm ───
+      # ─── JDK ───
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # ─── Android SDK + NDK ───
+      - name: Setup Android SDK + NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages & NDK
+        run: |
+          sdkmanager --install "platforms;android-33" "platform-tools" "ndk;25.2.9519653" "build-tools;33.0.0"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/25.2.9519653" >> $GITHUB_ENV
+          echo "NDK_HOME=$ANDROID_HOME/ndk/25.2.9519653" >> $GITHUB_ENV
+
+      # ─── Node + pnpm ───
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: Install pnpm
-        run: npm install -g pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
 
-      # ─── 修复 lockfile 并安装前端依赖 ───
-      # 关键修复：lockfile 与 frontend-lib/package.json 不同步
-      # (@tauri-apps/api 2.7.0 在 package.json 中但 lockfile 缺少解析条目)
-      # 使用 --no-frozen-lockfile 让 pnpm 自动更新 lockfile
-      - name: Install frontend dependencies (fix lockfile)
+      - name: Configure pnpm mirror
         run: |
           pnpm config set registry https://registry.npmmirror.com
-          # 删除旧的 lockfile 让 pnpm 重新生成，彻底解决不一致问题
+          pnpm config set @tauri-apps:registry https://registry.npmmirror.com
+
+      # ─── 安装前端依赖（不冻结 lockfile）───
+      - name: Install frontend dependencies
+        working-directory: ./easytier-gui
+        run: |
+          # 删除旧 lockfile，让 pnpm 基于当前 package.json 重新解析
           rm -f pnpm-lock.yaml
           pnpm install --no-frozen-lockfile
 
-      - name: Build frontend library
-        working-directory: easytier-web/frontend-lib
-        run: pnpm build
-
-      - name: Verify frontend build output
+      # ─── 对齐 Tauri CLI 到 2.7.0（与 Cargo.toml 的 tauri crate 一致）───
+      - name: Install Tauri CLI v${{ env.TURI_CLI_VERSION }}
         run: |
-          echo "=== 检查前端构建产物 ==="
-          ls -la easytier-web/frontend-lib/dist/ 2>/dev/null || echo "⚠️ dist 目录不存在"
-          echo "=== 检查关键关键词 ==="
-          grep -r "advanced_settings\|port_forwards\|clipboard_sync" \
-            easytier-web/frontend-lib/dist/ 2>/dev/null | head -5 || echo "⚠️ 未找到关键关键词"
+          cargo install tauri-cli --version ${{ env.TURI_CLI_VERSION }} --locked --force
+          cargo tauri info
 
-      # ─── 安装 Tauri CLI ───
-      - name: Install Tauri CLI
+      # ─── 验证前端构建产物 ───
+      - name: Verify frontend build
+        working-directory: ./easytier-gui
         run: |
-          cargo install tauri-cli --version "^2" --locked 2>/dev/null || true
+          pnpm --filter easytier-web build
+          test -d "src-tauri/gen/apple" || echo "iOS assets not generated (expected on Linux)"
+          ls -la src-tauri/
 
       # ─── 添加 swap 防止 OOM ───
       - name: Add swap space
         run: |
-          sudo fallocate -l 8G /swapfile 2>/dev/null || true
-          sudo chmod 600 /swapfile 2>/dev/null || true
-          sudo mkswap /swapfile 2>/dev/null || true
-          sudo swapon /swapfile 2>/dev/null || true
+          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
           free -h
 
-      # ─── 构建 Android APK ───
+      # ─── 构建 APK ───
       - name: Build Android APK
-        working-directory: easytier-gui
+        working-directory: ./easytier-gui/src-tauri
         run: |
-          if [ "${{ github.event.inputs.build_type }}" = "release" ]; then
-            cargo tauri android build --release
-          else
-            cargo tauri android build --apk
-          fi
+          cargo tauri android build --apk --target aarch64
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+          NDK_HOME: ${{ env.NDK_HOME }}
 
       # ─── 查找并上传 APK ───
       - name: Find APK
         id: find_apk
         run: |
-          APK=$(find easytier-gui/gen/android/app/build/outputs/apk -name "*.apk" 2>/dev/null | head -1)
-          if [ -z "$APK" ]; then
-            echo "❌ 未找到 APK 文件"
-            echo "=== 输出目录内容 ==="
-            find easytier-gui/gen/android/app/build/ -type f 2>/dev/null | head -30
+          APK_PATH=$(find ./easytier-gui/src-tauri/gen/android -name "*.apk" -type f 2>/dev/null | head -1)
+          if [ -z "$APK_PATH" ]; then
+            echo "::error::APK not found"
+            find ./easytier-gui/src-tauri/gen -type f -name "*" | head -50
             exit 1
           fi
-          echo "✅ 找到 APK: $APK"
-          cp "$APK" /tmp/easytier-transfer.apk
-          ls -lh /tmp/easytier-transfer.apk
-          echo "apk_path=$APK" >> $GITHUB_OUTPUT
+          echo "apk_path=$APK_PATH" >> $GITHUB_OUTPUT
+          echo "Found APK: $APK_PATH"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: easytier-transfer-android-${{ github.event.inputs.build_type || 'debug' }}
-          path: /tmp/easytier-transfer.apk
+          name: easytier-transfer-apk
+          path: ${{ steps.find_apk.outputs.apk_path }}
           retention-days: 30
 
       # ─── 构建摘要 ───
-      - name: Build Summary
+      - name: Build summary
         if: always()
         run: |
-          echo "## 📱 EasyTier Transfer Android" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **包名**: com.easyshare.easytier" >> $GITHUB_STEP_SUMMARY
-          echo "- **版本**: v2.6.4" >> $GITHUB_STEP_SUMMARY
-          echo "- **构建类型**: ${{ github.event.inputs.build_type || 'debug' }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **提交**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **时间**: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S CST')" >> $GITHUB_STEP_SUMMARY
-          if [ -f /tmp/easytier-transfer.apk ]; then
-            echo "- **APK**: ✅ $(du -h /tmp/easytier-transfer.apk | cut -f1)" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- **APK**: ❌ 未生成" >> $GITHUB_STEP_SUMMARY
+          echo "## 📱 Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Tauri crate: 2.7.0 (locked in Cargo.toml)" >> $GITHUB_STEP_SUMMARY
+          echo "- Tauri CLI: ${{ env.TURI_CLI_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Rust: 1.95" >> $GITHUB_STEP_SUMMARY
+          echo "- NDK: 25.2.9519653" >> $GITHUB_STEP_SUMMARY
+          echo "- Target: aarch64-linux-android" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ steps.find_apk.outputs.apk_path }}" ]; then
+            echo "- APK: ${{ steps.find_apk.outputs.apk_path }}" >> $GITHUB_STEP_SUMMARY
           fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 🔧 排查提示" >> $GITHUB_STEP_SUMMARY
-          echo "- 如果 UI 选项缺失，检查 'Verify frontend build output' 步骤" >> $GITHUB_STEP_SUMMARY
-          echo "- 如果 OOM，检查 swap 空间是否生效" >> $GITHUB_STEP_SUMMARY
-          echo "- 如果 sdkmanager 找不到，检查 'Setup Android SDK' 步骤" >> $GITHUB_STEP_SUMMARY
-          echo "- 查看 Actions 日志获取详细错误信息" >> $GITHUB_STEP_SUMMARY
