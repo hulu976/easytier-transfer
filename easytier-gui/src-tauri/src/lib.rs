@@ -656,8 +656,8 @@ mod mobile_clipboard {
 
 #[cfg(target_os = "android")]
 use mobile_clipboard::{
-    is_accessibility_enabled, open_accessibility_settings, run_clipboard_sync, send_file,
-    stop_clipboard_sync,
+    is_accessibility_enabled, open_accessibility_settings, pick_and_send_file, run_clipboard_sync,
+    send_file, stop_clipboard_sync,
 };
 
 #[tauri::command]
