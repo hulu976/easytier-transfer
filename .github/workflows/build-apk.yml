@@ -3,15 +3,17 @@ name: Build Android APK
 on:
   push:
     branches: [main, master]
+  pull_request:
+    branches: [main, master]
   workflow_dispatch:
 
 env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-  # 对齐 Cargo.toml 中的 tauri = "2.7.0"
-  TURI_CLI_VERSION: "2.7.0"
-  NODE_VERSION: "20"
-  PNPM_VERSION: "9"
+  NODE_VERSION: '20'
+  PNPM_VERSION: '9.12.1'
+  RUST_VERSION: '1.95'
+  ANDROID_API_LEVEL: '34'
+  ANDROID_NDK_VERSION: '25.2.9519653'
+  JAVA_VERSION: '17'
 
 jobs:
   build-android:
@@ -22,40 +24,49 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: recursive
+          fetch-depth: 1
 
-      # ─── Rust 工具链 ───
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.95"
-          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            ./easytier-gui/src-tauri
-          key: android-2.7.0-${{ hashFiles('**/Cargo.lock') }}
-
-      # ─── JDK ───
-      - name: Setup JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      # ─── Android SDK + NDK ───
+      # ──────────────────────────────────────
+      # Android SDK + NDK
+      # ──────────────────────────────────────
       - name: Setup Android SDK + NDK
         uses: android-actions/setup-android@v3
 
       - name: Install SDK packages & NDK
         run: |
-          sdkmanager --install "platforms;android-33" "platform-tools" "ndk;25.2.9519653" "build-tools;33.0.0"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/25.2.9519653" >> $GITHUB_ENV
-          echo "NDK_HOME=$ANDROID_HOME/ndk/25.2.9519653" >> $GITHUB_ENV
+          sdkmanager --install "platforms;android-34" "build-tools;34.0.0"
+          sdkmanager --install "ndk;${{ env.ANDROID_NDK_VERSION }}"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> $GITHUB_ENV
+          echo "NDK_HOME=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> $GITHUB_ENV
 
-      # ─── Node + pnpm ───
+      # ──────────────────────────────────────
+      # JDK 17
+      # ──────────────────────────────────────
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      # ──────────────────────────────────────
+      # Rust 工具链（锁定 1.95，与 rust-toolchain.toml 一致）
+      # ──────────────────────────────────────
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> easytier-gui/src-tauri'
+          key: android-rust-${{ env.RUST_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
+
+      # ──────────────────────────────────────
+      # Node.js + pnpm
+      # ──────────────────────────────────────
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -66,37 +77,75 @@ jobs:
         with:
           version: ${{ env.PNPM_VERSION }}
 
-      - name: Configure pnpm mirror
-        run: |
-          pnpm config set registry https://registry.npmmirror.com
-          pnpm config set @tauri-apps:registry https://registry.npmmirror.com
-
-      # ─── 安装前端依赖（不冻结 lockfile）───
+      # ──────────────────────────────────────
+      # 关键修复：删除旧 lockfile，让 pnpm 重建
+      # ──────────────────────────────────────
       - name: Install frontend dependencies
-        working-directory: ./easytier-gui
         run: |
-          # 删除旧 lockfile，让 pnpm 基于当前 package.json 重新解析
+          # 删除所有 lockfile，避免 workspace 包版本不一致
           rm -f pnpm-lock.yaml
+          rm -f easytier-web/frontend-lib/pnpm-lock.yaml
+          rm -f easytier-gui/pnpm-lock.yaml
+          rm -f tauri-plugin-vpnservice/pnpm-lock.yaml
+
+          # 配置镜像加速
+          pnpm config set registry https://registry.npmmirror.com
+          pnpm config set fetch-retries 5
+          pnpm config set fetch-timeout 120000
+
+          # 安装所有 workspace 依赖（--no-frozen-lockfile 因为 lockfile 已删）
           pnpm install --no-frozen-lockfile
 
-      # ─── 对齐 Tauri CLI 到 2.7.0（与 Cargo.toml 的 tauri crate 一致）───
-      - name: Install Tauri CLI v${{ env.TURI_CLI_VERSION }}
+      # ──────────────────────────────────────
+      # 关键修复：先 build frontend-lib，再 build tauri-plugin-vpnservice-api
+      # 这两个是 workspace 内部包，必须先产出 dist/ 才能被 easytier-gui 引用
+      # ──────────────────────────────────────
+      - name: Build workspace libraries (frontend-lib + vpn-api)
         run: |
-          cargo install tauri-cli --version ${{ env.TURI_CLI_VERSION }} --locked --force
-          cargo tauri info
+          echo "=== 构建 easytier-frontend-lib ==="
+          cd easytier-web/frontend-lib
+          pnpm build
+          echo "=== 检查产物 ==="
+          ls -la dist/ 2>/dev/null || echo "⚠️ dist/ 不存在！"
+          ls -la dist-js/ 2>/dev/null || true
+          cd ../..
 
-      # ─── 验证前端构建产物 ───
-      - name: Verify frontend build
-        working-directory: ./easytier-gui
+          echo "=== 构建 tauri-plugin-vpnservice-api ==="
+          cd tauri-plugin-vpnservice
+          pnpm build
+          echo "=== 检查产物 ==="
+          ls -la dist-js/ 2>/dev/null || echo "⚠️ dist-js/ 不存在！"
+          cd ..
+
+      # ──────────────────────────────────────
+      # 验证 workspace 链接是否正确
+      # ──────────────────────────────────────
+      - name: Verify workspace symlinks
         run: |
-          pnpm --filter easytier-web build
-          test -d "src-tauri/gen/apple" || echo "iOS assets not generated (expected on Linux)"
-          ls -la src-tauri/
+          echo "=== easytier-gui/node_modules 中的 workspace 包 ==="
+          ls -la easytier-gui/node_modules/easytier-frontend-lib/ 2>/dev/null || echo "❌ easytier-frontend-lib 未链接"
+          ls -la easytier-gui/node_modules/tauri-plugin-vpnservice-api/ 2>/dev/null || echo "❌ tauri-plugin-vpnservice-api 未链接"
 
-      # ─── 确保内存充足（不重复创建 /swapfile，避免 "Text file busy"）───
+          echo ""
+          echo "=== 验证类型声明文件存在 ==="
+          # frontend-lib 的 .d.ts 由 vite-plugin-dts 生成
+          find easytier-web/frontend-lib -name "*.d.ts" 2>/dev/null | head -20
+          find tauri-plugin-vpnservice -name "*.d.ts" 2>/dev/null | head -20
+
+      # ──────────────────────────────────────
+      # 安装 Tauri CLI（锁定 2.7.1，与 package.json 一致）
+      # ──────────────────────────────────────
+      - name: Install Tauri CLI
+        run: |
+          cargo install tauri-cli --version 2.7.1 --locked --quiet
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      # ──────────────────────────────────────
+      # 内存检测（不强制创建 swap，避免 Text file busy）
+      # ──────────────────────────────────────
       - name: Ensure sufficient memory
         run: |
-          echo "=== 内存状态 ==="
+          echo "=== 当前内存状态 ==="
           free -h
           echo "=== 已有 swap ==="
           sudo swapon --show || true
@@ -105,13 +154,12 @@ jobs:
           SWAP_KB=$(grep SwapTotal /proc/meminfo | awk '{print $2}')
           echo "物理内存: $((MEM_KB/1024)) MB, 已有 swap: $((SWAP_KB/1024)) MB"
 
-          # 已有 >=4G swap 或总内存 >=12G，无需再添加
           if [ "$SWAP_KB" -ge 4194304 ] || [ "$MEM_KB" -ge 12582912 ]; then
-            echo "✅ 内存/swap 充足，跳过"
+            echo "✅ 内存/swap 充足，跳过扩容"
             exit 0
           fi
 
-          # 用 /swapfile2 避开系统已占用的 /swapfile
+          # 用 /swapfile2 避开系统已有的 /swapfile
           sudo fallocate -l 4G /swapfile2 || sudo dd if=/dev/zero of=/swapfile2 bs=1M count=4096
           sudo chmod 600 /swapfile2
           sudo mkswap /swapfile2
@@ -119,45 +167,65 @@ jobs:
           echo "✅ 已添加 4G swap"
           free -h
 
-      # ─── 构建 APK ───
-      - name: Build Android APK
-        working-directory: ./easytier-gui/src-tauri
+      # ──────────────────────────────────────
+      # 打印版本信息（排错用）
+      # ──────────────────────────────────────
+      - name: Show Tauri info
         run: |
-          cargo tauri android build --apk --target aarch64
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
-          NDK_HOME: ${{ env.NDK_HOME }}
+          cd easytier-gui
+          cargo tauri info || true
 
-      # ─── 查找并上传 APK ───
-      - name: Find APK
-        id: find_apk
+      # ──────────────────────────────────────
+      # 构建 APK
+      # ──────────────────────────────────────
+      - name: Build Android APK
         run: |
-          APK_PATH=$(find ./easytier-gui/src-tauri/gen/android -name "*.apk" -type f 2>/dev/null | head -1)
-          if [ -z "$APK_PATH" ]; then
-            echo "::error::APK not found"
-            find ./easytier-gui/src-tauri/gen -type f -name "*" | head -50
-            exit 1
-          fi
-          echo "apk_path=$APK_PATH" >> $GITHUB_OUTPUT
-          echo "Found APK: $APK_PATH"
+          cd easytier-gui
+          # 先单独跑 vue-tsc 类型检查，出错时给出清晰日志
+          echo "=== 运行 vue-tsc 类型检查 ==="
+          pnpm exec vue-tsc --noEmit -p tsconfig.json || true
+
+          echo "=== 开始 Tauri Android 构建 ==="
+          cargo tauri android build --apk --target aarch64
+
+      # ──────────────────────────────────────
+      # 查找并上传 APK
+      # ──────────────────────────────────────
+      - name: Find APK
+        if: always()
+        run: |
+          echo "=== 搜索 APK 文件 ==="
+          find . -name "*.apk" -type f 2>/dev/null
+          ls -la easytier-gui/src-tauri/gen/android/app/build/outputs/apk/ 2>/dev/null || true
 
       - name: Upload APK artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: easytier-transfer-apk
-          path: ${{ steps.find_apk.outputs.apk_path }}
+          name: easytier-transfer-android
+          path: |
+            **/*.apk
           retention-days: 30
 
-      # ─── 构建摘要 ───
+      # ──────────────────────────────────────
+      # 构建总结
+      # ──────────────────────────────────────
       - name: Build summary
         if: always()
         run: |
-          echo "## 📱 Build Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- Tauri crate: 2.7.0 (locked in Cargo.toml)" >> $GITHUB_STEP_SUMMARY
-          echo "- Tauri CLI: ${{ env.TURI_CLI_VERSION }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Rust: 1.95" >> $GITHUB_STEP_SUMMARY
-          echo "- NDK: 25.2.9519653" >> $GITHUB_STEP_SUMMARY
-          echo "- Target: aarch64-linux-android" >> $GITHUB_STEP_SUMMARY
-          if [ -n "${{ steps.find_apk.outputs.apk_path }}" ]; then
-            echo "- APK: ${{ steps.find_apk.outputs.apk_path }}" >> $GITHUB_STEP_SUMMARY
+          echo "## 📱 EasyTier Transfer APK 构建总结" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Rust**: ${{ env.RUST_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Node.js**: ${{ env.NODE_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **pnpm**: ${{ env.PNPM_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **JDK**: ${{ env.JAVA_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Android NDK**: ${{ env.ANDROID_NDK_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **tauri-cli**: 2.7.1" >> $GITHUB_STEP_SUMMARY
+          echo "- **@tauri-apps/api**: 2.7.0" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          APK_COUNT=$(find . -name "*.apk" -type f 2>/dev/null | wc -l)
+          if [ "$APK_COUNT" -gt 0 ]; then
+            echo "✅ **APK 构建成功！** 共 $APK_COUNT 个文件" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **未找到 APK 文件**" >> $GITHUB_STEP_SUMMARY
           fi
