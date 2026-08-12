@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">EasyTier 传输版</string>
+    <string name="main_activity_title">EasyTier 传输版</string>
+    <string name="clip_accessibility_label">EasyTier 剪贴板同步</string>
+    <string name="clip_accessibility_description">开启后，EasyTier 可在后台读取本机剪贴板并同步到虚拟网络内的其他设备。仅用于剪贴板同步，不会读取屏幕内容。</string>
+</resources>

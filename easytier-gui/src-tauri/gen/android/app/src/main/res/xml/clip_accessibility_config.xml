@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  剪贴板同步无障碍服务配置。
+
+  只声明最小能力：不抓取窗口内容、不检索交互节点，仅借用无障碍服务在后台
+  读取剪贴板的特权。事件类型设为 typeWindowContentChanged 是为了让服务保持
+  连接状态，实际逻辑走 ClipboardManager 的变更回调。
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowContentChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault"
+    android:canRetrieveWindowContent="false"
+    android:notificationTimeout="500"
+    android:description="@string/clip_accessibility_description" />

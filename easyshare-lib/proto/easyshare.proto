@@ -1,0 +1,55 @@
+syntax = "proto3";
+package easyshare;
+
+message Envelope {
+  uint32 version = 1;
+  MessageType type = 2;
+  bytes payload = 3;
+}
+
+enum MessageType {
+  CLIPBOARD_SYNC = 0;
+  FILE_OFFER = 1;
+  FILE_OFFER_RESP = 2;
+  FILE_CHUNK = 3;
+  FILE_COMPLETE = 4;
+  FILE_REJECT = 5;
+  HEARTBEAT = 6;
+}
+
+message ClipboardSync {
+  string device_name = 1;
+  ClipboardType clip_type = 2;
+  bytes data = 3;
+  uint64 timestamp = 4;
+}
+enum ClipboardType { TEXT = 0; IMAGE = 1; }
+
+message FileOffer {
+  string file_name = 1;
+  uint64 file_size = 2;
+  string file_hash = 3;
+  uint32 transfer_id = 4;
+}
+
+message FileOfferResp {
+  uint32 transfer_id = 1;
+  bool accept = 2;
+  string save_path = 3;
+}
+
+message FileChunk {
+  uint32 transfer_id = 1;
+  uint32 seq = 2;
+  bytes data = 3;
+}
+
+message FileComplete {
+  uint32 transfer_id = 1;
+  bool success = 2;
+}
+
+message Heartbeat {
+  string device_name = 1;
+  uint64 timestamp = 2;
+}

@@ -1,0 +1,44 @@
+[package]
+name = "easyshare"
+version = "0.1.0"
+edition = "2021"
+
+# 作为普通 Rust 库被 easytier-gui 直接链接（移动端进程内运行）。
+# Android 无法执行外部可执行文件，因此不再产出侧车 bin。
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "sync",
+    "macros",
+    "time",
+    "process",
+    "fs",
+] }
+prost = "0.13"
+prost-types = "0.13"
+sha2 = "0.10"
+socket2 = "0.6"
+log = "0.4"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# arboard 仅支持 Linux/Windows/macOS，Android 上由 JNI 走系统剪贴板，故隔离
+[target.'cfg(not(target_os = "android"))'.dependencies]
+arboard = "3"
+# 图片剪贴板：PNG 编解码（RGBA <-> PNG），仅非安卓（安卓图片走 JNI + FileProvider）。
+# 关闭默认 features：只需要 PNG，避免 avif(ravif/rav1e) 把 thiserror 版本抬高，
+# 与 workspace 内 sea-orm 锁定的 2.0.11 冲突。
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# JNI 桥接仅在 Android 编译
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+[build-dependencies]
+prost-build = "0.13"
