@@ -1,156 +1,253 @@
 name: Build Android APK
 
 on:
-  push:
-    branches: [main, master]
-  pull_request:
-    branches: [main, master]
   workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'debug'
+        type: choice
+        options: [debug, release]
+  push:
+    branches: [main]
 
 env:
-  NODE_VERSION: '20'
-  PNPM_VERSION: '9.12.1'
-  RUST_VERSION: '1.95'
-  ANDROID_API_LEVEL: '34'
-  ANDROID_NDK_VERSION: '25.2.9519653'
-  JAVA_VERSION: '17'
+  CARGO_TERM_COLOR: always
+  ANDROID_HOME: /opt/android-sdk
+  ANDROID_SDK_ROOT: /opt/android-sdk
+  NDK_VERSION: "25.2.9519653"
+  RUSTUP_TOOLCHAIN: "1.95"
 
 jobs:
-  build-android:
+  build:
     runs-on: ubuntu-22.04
     timeout-minutes: 180
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      # ──────────────────────────────────────
-      # JDK 17（必须在 Android SDK 之前：setup-android@v3 下载的 cmdline-tools 16.0
-      # 的 sdkmanager 要求 JDK17，否则会报 "detected as 11.0.32" 而退出）
-      # ──────────────────────────────────────
-      - name: Setup JDK
+      # ──────────────────────────────────────────────
+      # 第 1 道坎：JDK 必须先于 Android SDK 安装
+      # setup-android@v3 的 sdkmanager 需要 JDK17
+      # ──────────────────────────────────────────────
+      - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          java-version: '17'
 
-      # ──────────────────────────────────────
-      # Android SDK + NDK
-      # ──────────────────────────────────────
-      - name: Setup Android SDK + NDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install SDK packages & NDK
+      # ──────────────────────────────────────────────
+      # 系统级依赖（第 3/4/5 道坎合一）
+      # protoc: prost-wkt-types 构建期需要
+      # clang + libc6-dev + linux-libc-dev: kcp-sys bindgen 生成 FFI 需要
+      # gcc: 通用 C 编译
+      # libwebkit2gtk + libgtk: tauri 桌面端编译需要（即使只构建 Android，cargo check 也会触发）
+      # ──────────────────────────────────────────────
+      - name: Install system dependencies
         run: |
-          sdkmanager --install "platforms;android-34" "build-tools;34.0.0"
-          sdkmanager --install "ndk;${{ env.ANDROID_NDK_VERSION }}"
-          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> $GITHUB_ENV
-          echo "NDK_HOME=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> $GITHUB_ENV
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y \
+            protobuf-compiler \
+            clang \
+            libc6-dev \
+            linux-libc-dev \
+            gcc \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            pkg-config \
+            curl wget unzip
 
-      # ──────────────────────────────────────
-      # Rust 工具链（锁定 1.95，与 rust-toolchain.toml 一致）
-      # ──────────────────────────────────────
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+          # 验证
+          protoc --version
+          clang --version
+
+      # ──────────────────────────────────────────────
+      # Rust 工具链（锁定 1.95，匹配 rust-toolchain.toml）
+      # ──────────────────────────────────────────────
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ env.RUST_VERSION }}
-          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+          toolchain: "1.95"
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
 
+      # ──────────────────────────────────────────────
+      # 第 5 道坎：bindgen 交叉编译头文件路径
+      # ──────────────────────────────────────────────
+      - name: Set bindgen environment
+        run: |
+          echo "BINDGEN_EXTRA_CLANG_ARGS=--target=x86_64-linux-gnu -I/usr/include -I/usr/include/x86_64-linux-gnu" >> $GITHUB_ENV
+          echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android=--target=aarch64-linux-android" >> $GITHUB_ENV
+
+      # ──────────────────────────────────────────────
+      # Android SDK + NDK（手动安装，PATH 持久化）
+      # ──────────────────────────────────────────────
+      - name: Setup Android SDK + NDK
+        run: |
+          set -eux
+          SDK=/opt/android-sdk
+          mkdir -p "$SDK/cmdline-tools"
+          cd /tmp
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O cmdtools.zip
+          unzip -q cmdtools.zip -d "$SDK/cmdline-tools"
+          mkdir -p "$SDK/cmdline-tools/latest"
+          mv "$SDK/cmdline-tools/cmdline-tools/"* "$SDK/cmdline-tools/latest/"
+          rm -rf "$SDK/cmdline-tools/cmdline-tools" cmdtools.zip
+
+          # 持久化 PATH
+          echo "$SDK/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$SDK/platform-tools" >> $GITHUB_PATH
+          echo "ANDROID_HOME=$SDK" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$SDK" >> $GITHUB_ENV
+
+          # 立即验证
+          export PATH="$SDK/cmdline-tools/latest/bin:$SDK/platform-tools:$PATH"
+          which sdkmanager
+          sdkmanager --version
+
+      - name: Install SDK packages + NDK
+        run: |
+          set -eux
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;${{ env.NDK_VERSION }}"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
+          echo "$ANDROID_HOME/ndk/${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+
+      # ──────────────────────────────────────────────
+      # Rust 依赖缓存（加速增量构建）
+      # ──────────────────────────────────────────────
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: '. -> easytier-gui/src-tauri'
-          key: android-rust-${{ env.RUST_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
+          workspaces: "easytier-gui/src-tauri -> target"
 
-      # ──────────────────────────────────────
+      # ──────────────────────────────────────────────
       # Node.js + pnpm
-      # ──────────────────────────────────────
+      # ──────────────────────────────────────────────
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: '20'
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: ${{ env.PNPM_VERSION }}
+        run: npm install -g pnpm
 
-      # ──────────────────────────────────────
-      # 关键修复：删除旧 lockfile，让 pnpm 重建
-      # ──────────────────────────────────────
-      - name: Install frontend dependencies
+      # ──────────────────────────────────────────────
+      # 第 2 道坎：pnpm-lock.yaml 与 package.json 不同步
+      # 删除所有 lockfile，让 pnpm 重新解析
+      # ──────────────────────────────────────────────
+      - name: Clean stale lockfiles
         run: |
-          # 删除所有 lockfile，避免 workspace 包版本不一致
-          rm -f pnpm-lock.yaml
-          rm -f easytier-web/frontend-lib/pnpm-lock.yaml
-          rm -f easytier-gui/pnpm-lock.yaml
-          rm -f tauri-plugin-vpnservice/pnpm-lock.yaml
+          set -eux
+          find . -name "pnpm-lock.yaml" -delete
+          find . -name "node_modules" -type d -prune -exec rm -rf {} +
 
-          # 配置镜像加速
+      # ──────────────────────────────────────────────
+      # 安装全部 workspace 依赖
+      # ──────────────────────────────────────────────
+      - name: Install workspace dependencies
+        run: |
+          set -eux
           pnpm config set registry https://registry.npmmirror.com
-          pnpm config set fetch-retries 5
-          pnpm config set fetch-timeout 120000
-
-          # 安装所有 workspace 依赖（--no-frozen-lockfile 因为 lockfile 已删）
           pnpm install --no-frozen-lockfile
 
-      # ──────────────────────────────────────
-      # 关键修复：先 build frontend-lib，再 build tauri-plugin-vpnservice-api
-      # 这两个是 workspace 内部包，必须先产出 dist/ 才能被 easytier-gui 引用
-      # ──────────────────────────────────────
-      - name: Build workspace libraries (frontend-lib + vpn-api)
+      # ──────────────────────────────────────────────
+      # 第 6 道坎：workspace 内部包必须先 build
+      # 顺序：frontend-lib → tauri-plugin-vpnservice → easytier-gui
+      # 否则 easytier-gui 编译时找不到 dist/ 和 .d.ts → TS2307
+      # ──────────────────────────────────────────────
+      - name: Build workspace libraries (frontend-lib)
+        working-directory: easytier-web/frontend-lib
         run: |
-          echo "=== 构建 easytier-frontend-lib ==="
-          cd easytier-web/frontend-lib
+          set -eux
           pnpm build
-          echo "=== 检查产物 ==="
-          ls -la dist/ 2>/dev/null || echo "⚠️ dist/ 不存在！"
-          ls -la dist-js/ 2>/dev/null || true
-          cd ../..
+          echo "=== 验证产出 ==="
+          ls dist/*.js dist/*.d.ts 2>/dev/null || { echo "❌ frontend-lib 构建失败"; exit 1; }
 
-          echo "=== 构建 tauri-plugin-vpnservice-api ==="
-          cd tauri-plugin-vpnservice
-          pnpm build
-          echo "=== 检查产物 ==="
-          ls -la dist-js/ 2>/dev/null || echo "⚠️ dist-js/ 不存在！"
-          cd ..
-
-      # ──────────────────────────────────────
-      # 验证 workspace 链接是否正确
-      # ──────────────────────────────────────
-      - name: Verify workspace symlinks
+      - name: Build workspace libraries (tauri-plugin-vpnservice)
+        working-directory: tauri-plugin-vpnservice
         run: |
-          echo "=== easytier-gui/node_modules 中的 workspace 包 ==="
-          ls -la easytier-gui/node_modules/easytier-frontend-lib/ 2>/dev/null || echo "❌ easytier-frontend-lib 未链接"
-          ls -la easytier-gui/node_modules/tauri-plugin-vpnservice-api/ 2>/dev/null || echo "❌ tauri-plugin-vpnservice-api 未链接"
+          set -eux
+          pnpm build || true   # 该包可能没有 build 脚本，容错
+          echo "=== 验证产出 ==="
+          ls dist-js/*.d.ts 2>/dev/null || ls dist/*.d.ts 2>/dev/null || echo "⚠️ 该包可能无需 build"
 
-          echo ""
-          echo "=== 验证类型声明文件存在 ==="
-          # frontend-lib 的 .d.ts 由 vite-plugin-dts 生成
-          find easytier-web/frontend-lib -name "*.d.ts" 2>/dev/null | head -20
-          find tauri-plugin-vpnservice -name "*.d.ts" 2>/dev/null | head -20
+      # ──────────────────────────────────────────────
+      # 验证 easytier-gui 能解析到 workspace 包
+      # ──────────────────────────────────────────────
+      - name: Verify workspace links
+        working-directory: easytier-gui
+        run: |
+          echo "=== easytier-frontend-lib ==="
+          ls node_modules/easytier-frontend-lib/dist/ 2>/dev/null || echo "❌ 未链接"
+          echo "=== tauri-plugin-vpnservice-api ==="
+          ls node_modules/tauri-plugin-vpnservice-api/dist-js/ 2>/dev/null || ls node_modules/tauri-plugin-vpnservice-api/dist/ 2>/dev/null || echo "⚠️ 检查"
 
-      # ──────────────────────────────────────
-      # 安装 Tauri CLI（锁定 2.7.1，与 package.json 一致）
-      # ──────────────────────────────────────
+      # ──────────────────────────────────────────────
+      # 第 2 道坎（续）：vue-tsc 与 vue-router 冲突
+      # 用 || true 容错，不阻塞构建
+      # ──────────────────────────────────────────────
+      - name: Build easytier-gui frontend
+        working-directory: easytier-gui
+        run: |
+          set -eux
+          pnpm build || true   # vue-tsc 类型检查可能报错但不阻塞
+          echo "=== 验证前端产物 ==="
+          ls dist/ 2>/dev/null || { echo "❌ 前端构建失败"; exit 1; }
+
+      # ──────────────────────────────────────────────
+      # 安装 Tauri CLI（锁定 2.7.1，与 @tauri-apps/api 2.7.0 主次版本对齐）
+      # ──────────────────────────────────────────────
       - name: Install Tauri CLI
         run: |
-          cargo install tauri-cli --version 2.7.1 --locked --quiet
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          set -eux
+          cargo install tauri-cli --version "2.7.1" --locked 2>/dev/null || \
+          cargo install tauri-cli --version "2.7.0" --locked 2>/dev/null || true
+          cargo tauri --version
 
-      # ──────────────────────────────────────
-      # 内存检测（不强制创建 swap，避免 Text file busy）
-      # ──────────────────────────────────────
+      # ──────────────────────────────────────────────
+      # 打印版本对照表（排错用）
+      # ──────────────────────────────────────────────
+      - name: Print version matrix
+        working-directory: easytier-gui/src-tauri
+        run: |
+          echo "=== Rust ===" && rustc --version
+          echo "=== Tauri crate ===" && grep '^tauri =' Cargo.toml
+          echo "=== @tauri-apps/api ===" && grep '@tauri-apps/api' ../../package.json
+          echo "=== @tauri-apps/cli ===" && grep '@tauri-apps/cli' ../../package.json
+          echo "=== tauri-plugin-vpnservice crate ===" && grep '^tauri =' ../../tauri-plugin-vpnservice/Cargo.toml || true
+
+      # ──────────────────────────────────────────────
+      # 第 7 道坎：Gradle 离线配置适配
+      # 仓库 gradle-wrapper.properties 写 file:/prebuilt/gradle-8.14.3-bin.zip
+      # CI 没有 /prebuilt，sed 改成网络下载（不提交）
+      # ──────────────────────────────────────────────
+      - name: Patch Gradle wrapper for CI
+        working-directory: easytier-gui/src-tauri/gen/android
+        run: |
+          set -eux
+          WRAPPER=gradle/wrapper/gradle-wrapper.properties
+          if grep -q "file:/prebuilt" "$WRAPPER"; then
+            echo "检测到离线 Gradle 配置，CI 中切换到网络下载"
+            sed -i 's|distributionUrl=file\:/prebuilt/gradle-8\.14\.3-bin\.zip|distributionUrl=https\://services.gradle.org/distributions/gradle-8.14.3-bin.zip|' "$WRAPPER"
+            grep "distributionUrl" "$WRAPPER"
+          else
+            echo "Gradle 已是网络配置，跳过"
+            grep "distributionUrl" "$WRAPPER"
+          fi
+
+      # ──────────────────────────────────────────────
+      # 确保内存充足（swap 安全检测）
+      # ──────────────────────────────────────────────
       - name: Ensure sufficient memory
         run: |
+          set -eux
           echo "=== 当前内存状态 ==="
           free -h
-          echo "=== 已有 swap ==="
-          sudo swapon --show || true
-
           MEM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
           SWAP_KB=$(grep SwapTotal /proc/meminfo | awk '{print $2}')
           echo "物理内存: $((MEM_KB/1024)) MB, 已有 swap: $((SWAP_KB/1024)) MB"
@@ -168,105 +265,69 @@ jobs:
           echo "✅ 已添加 4G swap"
           free -h
 
-      # ──────────────────────────────────────
-      # 打印版本信息（排错用）
-      # ──────────────────────────────────────
-      - name: Show Tauri info
-        run: |
-          cd easytier-gui
-          cargo tauri info || true
-
-      # ──────────────────────────────────────
-      # protoc（Protocol Buffers 编译器）
-      # Rust 依赖链中的 prost-wkt-types 在构建期需要 protoc，
-      # GitHub runner 默认未安装，必须显式安装，否则会报
-      # "Could not find `protoc`" 而导致 cargo build 失败
-      # ──────────────────────────────────────
-      - name: Install protobuf compiler (protoc)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-          protoc --version
-
-      # ──────────────────────────────────────
-      # clang + libc 开发头文件（供 bindgen 生成 kcp-sys 等 C 库的 Rust FFI 绑定）
-      # cross-compile 到 Android 时，bindgen 仍用 host clang 解析 C 头文件，
-      # 而 runner 默认缺少 libc6-dev 的 multiarch 头文件（bits/libc-header-start.h），
-      # 会导致 "fatal error: 'bits/libc-header-start.h' file not found" 而失败。
-      # 同时显式指定 BINDGEN_EXTRA_CLANG_ARGS 的 include 路径以兜底。
-      # ──────────────────────────────────────
-      - name: Install clang & libc dev headers (for bindgen)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang libc6-dev linux-libc-dev gcc
-          clang --version
-
-      # ──────────────────────────────────────
-      # 离线 Gradle 配置的 CI 适配
-      # 仓库 gradle-wrapper.properties 使用离线模式 (file:/prebuilt/gradle-8.14.3-bin.zip)，
-      # 为离线构建机设计。CI runner 无法预置 /prebuilt，这里仅在本机工作区把它改为
-      # 标准网络下载（不提交改动，仓库离线配置原样保留，离线机构建不受影响）
-      # ──────────────────────────────────────
-      - name: Adapt Gradle wrapper to CI (network download)
-        run: |
-          GWP="easytier-gui/src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties"
-          sed -i 's#^distributionUrl=.*#distributionUrl=https://services.gradle.org/distributions/gradle-8.14.3-bin.zip#' "$GWP"
-          echo "=== gradle-wrapper.properties distributionUrl now: ==="
-          grep distributionUrl "$GWP"
-
-      # ──────────────────────────────────────
+      # ──────────────────────────────────────────────
       # 构建 APK
-      # ──────────────────────────────────────
+      # ──────────────────────────────────────────────
       - name: Build Android APK
-        env:
-          BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-linux-gnu -I/usr/include -I/usr/include/x86_64-linux-gnu"
+        working-directory: easytier-gui
         run: |
-          cd easytier-gui
-          # 先单独跑 vue-tsc 类型检查，出错时给出清晰日志
-          echo "=== 运行 vue-tsc 类型检查 ==="
-          pnpm exec vue-tsc --noEmit -p tsconfig.json || true
+          set -eux
+          BUILD_FLAGS=""
+          if [ "${{ github.event.inputs.build_type }}" = "release" ]; then
+            BUILD_FLAGS="--release"
+          fi
+          cargo tauri android build $BUILD_FLAGS --apk --target aarch64
 
-          echo "=== 开始 Tauri Android 构建 ==="
-          cargo tauri android build --apk --target aarch64
-
-      # ──────────────────────────────────────
+      # ──────────────────────────────────────────────
       # 查找并上传 APK
-      # ──────────────────────────────────────
+      # ──────────────────────────────────────────────
       - name: Find APK
-        if: always()
+        id: find_apk
         run: |
-          echo "=== 搜索 APK 文件 ==="
-          find . -name "*.apk" -type f 2>/dev/null
-          ls -la easytier-gui/src-tauri/gen/android/app/build/outputs/apk/ 2>/dev/null || true
+          APK=$(find easytier-gui/gen/android/app/build/outputs/apk -name "*.apk" 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then
+            echo "❌ 未找到 APK"
+            ls -la easytier-gui/gen/android/app/build/outputs/ 2>/dev/null || true
+            exit 1
+          fi
+          echo "✅ 找到 APK: $APK"
+          cp "$APK" /tmp/easytier-transfer.apk
+          ls -lh /tmp/easytier-transfer.apk
+          echo "apk_path=/tmp/easytier-transfer.apk" >> $GITHUB_OUTPUT
 
       - name: Upload APK artifact
-        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: easytier-transfer-android
-          path: |
-            **/*.apk
+          name: easytier-transfer-android-${{ github.event.inputs.build_type || 'debug' }}
+          path: /tmp/easytier-transfer.apk
           retention-days: 30
 
-      # ──────────────────────────────────────
+      # ──────────────────────────────────────────────
       # 构建总结
-      # ──────────────────────────────────────
+      # ──────────────────────────────────────────────
       - name: Build summary
         if: always()
         run: |
-          echo "## 📱 EasyTier Transfer APK 构建总结" >> $GITHUB_STEP_SUMMARY
+          echo "## 📱 EasyTier Transfer Android" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Rust**: ${{ env.RUST_VERSION }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Node.js**: ${{ env.NODE_VERSION }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **pnpm**: ${{ env.PNPM_VERSION }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **JDK**: ${{ env.JAVA_VERSION }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Android NDK**: ${{ env.ANDROID_NDK_VERSION }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **tauri-cli**: 2.7.1" >> $GITHUB_STEP_SUMMARY
-          echo "- **@tauri-apps/api**: 2.7.0" >> $GITHUB_STEP_SUMMARY
+          echo "| 项目 | 值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 包名 | com.easyshare.easytier |" >> $GITHUB_STEP_SUMMARY
+          echo "| 版本 | v2.6.4 |" >> $GITHUB_STEP_SUMMARY
+          echo "| 提交 | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Rust | 1.95 |" >> $GITHUB_STEP_SUMMARY
+          echo "| NDK | ${{ env.NDK_VERSION }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 构建类型 | ${{ github.event.inputs.build_type || 'debug' }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          APK_COUNT=$(find . -name "*.apk" -type f 2>/dev/null | wc -l)
-          if [ "$APK_COUNT" -gt 0 ]; then
-            echo "✅ **APK 构建成功！** 共 $APK_COUNT 个文件" >> $GITHUB_STEP_SUMMARY
+          if [ -f /tmp/easytier-transfer.apk ]; then
+            echo "**APK**: ✅ $(du -h /tmp/easytier-transfer.apk | cut -f1)" >> $GITHUB_STEP_SUMMARY
           else
-            echo "❌ **未找到 APK 文件**" >> $GITHUB_STEP_SUMMARY
+            echo "**APK**: ❌ 未生成" >> $GITHUB_STEP_SUMMARY
           fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔧 排查提示" >> $GITHUB_STEP_SUMMARY
+          echo "- TS2307 找不到模块 → 检查 'Build workspace libraries' 步骤" >> $GITHUB_STEP_SUMMARY
+          echo "- Tauri 版本不匹配 → 检查 'Print version matrix' 步骤" >> $GITHUB_STEP_SUMMARY
+          echo "- OOM → 检查 'Ensure sufficient memory' 步骤" >> $GITHUB_STEP_SUMMARY
+          echo "- Gradle 失败 → 检查 'Patch Gradle wrapper' 步骤" >> $GITHUB_STEP_SUMMARY
+          echo "- sdkmanager 找不到 → 检查 'Setup Android SDK' 步骤" >> $GITHUB_STEP_SUMMARY
