@@ -202,6 +202,19 @@ jobs:
           clang --version
 
       # ──────────────────────────────────────
+      # 离线 Gradle 配置的 CI 适配
+      # 仓库 gradle-wrapper.properties 使用离线模式 (file:/prebuilt/gradle-8.14.3-bin.zip)，
+      # 为离线构建机设计。CI runner 无法预置 /prebuilt，这里仅在本机工作区把它改为
+      # 标准网络下载（不提交改动，仓库离线配置原样保留，离线机构建不受影响）
+      # ──────────────────────────────────────
+      - name: Adapt Gradle wrapper to CI (network download)
+        run: |
+          GWP="easytier-gui/src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties"
+          sed -i 's#^distributionUrl=.*#distributionUrl=https://services.gradle.org/distributions/gradle-8.14.3-bin.zip#' "$GWP"
+          echo "=== gradle-wrapper.properties distributionUrl now: ==="
+          grep distributionUrl "$GWP"
+
+      # ──────────────────────────────────────
       # 构建 APK
       # ──────────────────────────────────────
       - name: Build Android APK
