@@ -1,0 +1,173 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    env:
+      ANDROID_HOME: /opt/android-sdk
+      ANDROID_SDK_ROOT: /opt/android-sdk
+      ANDROID_NDK_HOME: /opt/android-sdk/ndk/26.1.10909125
+      ANDROID_NDK_ROOT: /opt/android-sdk/ndk/26.1.10909125
+      NDK_VERSION: 26.1.10909125
+      JAVA_HOME: /usr/lib/jvm/temurin-17-jdk-amd64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libssl-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            pkg-config \
+            ca-certificates \
+            curl \
+            wget \
+            unzip \
+            zip \
+            git \
+            gcc \
+            g++ \
+            make \
+            cmake \
+            file \
+            patchelf \
+            protobuf-compiler
+
+      - name: Setup JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK + NDK manually
+        run: |
+          set -x
+          SDK=/opt/android-sdk
+          mkdir -p $SDK/cmdline-tools
+          cd /tmp
+
+          # Download command-line tools
+          wget -q "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" -O cmdtools.zip
+          unzip -q cmdtools.zip -d $SDK/cmdline-tools/
+          mv $SDK/cmdline-tools/cmdline-tools $SDK/cmdline-tools/latest
+          export PATH="$SDK/cmdline-tools/latest/bin:$PATH"
+
+          # Accept licenses and install packages
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;$NDK_VERSION"
+
+          # Set env vars for subsequent steps
+          echo "ANDROID_HOME=$SDK" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$SDK" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$SDK/ndk/$NDK_VERSION" >> $GITHUB_ENV
+          echo "NDK_HOME=$SDK/ndk/$NDK_VERSION" >> $GITHUB_ENV
+          echo "$SDK/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$SDK/platform-tools" >> $GITHUB_PATH
+          echo "$SDK/ndk/$NDK_VERSION" >> $GITHUB_PATH
+
+      - name: Verify Android SDK/NDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          ls $ANDROID_NDK_HOME/ndk-build 2>/dev/null && echo "NDK OK" || echo "NDK MISSING"
+          which sdkmanager && echo "sdkmanager OK" || echo "sdkmanager MISSING"
+          which adb && echo "adb OK" || echo "adb MISSING"
+
+      - name: Setup Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.95 --profile minimal
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          echo "CARGO_HOME=$HOME/.cargo" >> $GITHUB_ENV
+          echo "RUSTUP_HOME=$HOME/.rustup" >> $GITHUB_ENV
+
+      - name: Install Rust Android targets
+        run: |
+          source "$HOME/.cargo/env"
+          rustup target add aarch64-linux-android
+          rustup target add armv7-linux-androideabi
+          rustup target add x86_64-linux-android
+          rustup target add i686-linux-android
+
+      - name: Setup Node.js 20 + pnpm
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmmirror.com'
+
+      - name: Install pnpm
+        run: npm install -g pnpm --registry=https://registry.npmmirror.com
+
+      - name: pnpm install (with mirror)
+        run: |
+          pnpm config set registry https://registry.npmmirror.com
+          pnpm install --no-frozen-lockfile --registry=https://registry.npmmirror.com 2>&1 | tail -30
+
+      - name: Build frontend
+        run: |
+          pnpm -F easytier-web build 2>&1 | tail -40
+
+      - name: Verify frontend output
+        run: |
+          echo "=== Checking frontend dist ==="
+          ls -la easytier-web/frontend-lib/dist/ 2>/dev/null || echo "No dist dir"
+          ls -la easytier-web/frontend/dist/ 2>/dev/null || echo "No frontend/dist dir"
+          echo "=== Checking for key keywords in built JS ==="
+          JS_FILES=$(find easytier-web/frontend-lib/dist -name "*.js" -type f 2>/dev/null | head -5)
+          if [ -n "$JS_FILES" ]; then
+            for f in $JS_FILES; do
+              echo "--- $f ---"
+              grep -c "advanced_settings\|clipboard_sync\|port_forwards\|acl" "$f" 2>/dev/null | xargs -I{} echo "  Keyword matches: {}"
+            done
+          else
+            echo "WARNING: No JS files found in dist!"
+          fi
+
+      - name: Build Android APK (arm64 only for speed)
+        run: |
+          source "$HOME/.cargo/env"
+          export PATH="$ANDROID_NDK_HOME:$PATH"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
+          export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang
+          export TARGET_CC_aarch64_linux_android=$CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER
+          export TARGET_CXX_aarch64_linux_android=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++
+
+          cd easytier-gui/src-tauri
+          pnpm tauri android build --apk --target aarch64 2>&1 | tail -60
+
+      - name: Find and upload APK
+        run: |
+          echo "=== Searching for APK files ==="
+          find . -name "*.apk" -type f 2>/dev/null | while read apk; do
+            size=$(du -h "$apk" | cut -f1)
+            echo "Found: $apk ($size)"
+          done
+
+          # Copy APKs to a known location
+          mkdir -p /tmp/apk_output
+          find . -name "*.apk" -type f -exec cp {} /tmp/apk_output/ \;
+
+          ls -la /tmp/apk_output/
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: easytier-transfer-android
+          path: /tmp/apk_output/*.apk
+          retention-days: 30
