@@ -189,9 +189,24 @@ jobs:
           protoc --version
 
       # ──────────────────────────────────────
+      # clang + libc 开发头文件（供 bindgen 生成 kcp-sys 等 C 库的 Rust FFI 绑定）
+      # cross-compile 到 Android 时，bindgen 仍用 host clang 解析 C 头文件，
+      # 而 runner 默认缺少 libc6-dev 的 multiarch 头文件（bits/libc-header-start.h），
+      # 会导致 "fatal error: 'bits/libc-header-start.h' file not found" 而失败。
+      # 同时显式指定 BINDGEN_EXTRA_CLANG_ARGS 的 include 路径以兜底。
+      # ──────────────────────────────────────
+      - name: Install clang & libc dev headers (for bindgen)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libc6-dev linux-libc-dev gcc
+          clang --version
+
+      # ──────────────────────────────────────
       # 构建 APK
       # ──────────────────────────────────────
       - name: Build Android APK
+        env:
+          BINDGEN_EXTRA_CLANG_ARGS: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
         run: |
           cd easytier-gui
           # 先单独跑 vue-tsc 类型检查，出错时给出清晰日志
