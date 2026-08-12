@@ -17,50 +17,56 @@ env:
   ANDROID_HOME: /opt/android-sdk
   ANDROID_SDK_ROOT: /opt/android-sdk
   NDK_VERSION: "25.2.9519653"
+  RUST_VERSION: "1.95"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 1 }
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Install system deps
+      # ─── 安装系统依赖 ───
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
-            libayatana-appindicator3-dev librsvg2-dev libsdl2-dev \
-            pkg-config curl wget unzip openjdk-17-jdk-headless
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev \
+            libsdl2-dev pkg-config curl wget unzip \
+            openjdk-17-jdk-headless
 
-      - uses: dtolnay/rust-toolchain@stable
+      # ─── 安装 Rust 1.95 ───
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
 
-      - name: Setup Android SDK + NDK (manual, reliable PATH)
+      # ─── 设置 Android SDK + NDK ───
+      - name: Setup Android SDK + NDK
         run: |
           set -eux
           SDK=/opt/android-sdk
           mkdir -p "$SDK/cmdline-tools"
           cd /tmp
-          # 下载 commandlinetools
           wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O cmdtools.zip
           unzip -q cmdtools.zip -d "$SDK/cmdline-tools"
           mkdir -p "$SDK/cmdline-tools/latest"
           mv "$SDK/cmdline-tools/cmdline-tools/"* "$SDK/cmdline-tools/latest/"
           rm -rf "$SDK/cmdline-tools/cmdline-tools"
-          # 关键：把 sdkmanager 路径写入 GITHUB_PATH（持久化到后续 step）
           echo "$SDK/cmdline-tools/latest/bin" >> $GITHUB_PATH
           echo "$SDK/platform-tools" >> $GITHUB_PATH
           echo "ANDROID_HOME=$SDK" >> $GITHUB_ENV
           echo "ANDROID_SDK_ROOT=$SDK" >> $GITHUB_ENV
-          # 立即验证
           export PATH="$SDK/cmdline-tools/latest/bin:$SDK/platform-tools:$PATH"
-          which sdkmanager || { echo "❌ sdkmanager still not found"; ls -la "$SDK/cmdline-tools/latest/bin/"; exit 1; }
+          which sdkmanager
           sdkmanager --version
 
-      - name: Install SDK packages + NDK
+      - name: Install SDK packages & NDK
         run: |
           set -eux
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
@@ -68,65 +74,107 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
           echo "$ANDROID_HOME/ndk/${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-      - uses: Swatinem/rust-cache@v2
+      # ─── Rust 缓存 ───
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            easytier-gui/src-tauri -> easytier-gui/src-tauri/target
 
-      - uses: actions/setup-node@v4
-        with: { node-version: '20' }
+      # ─── Node.js + pnpm ───
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
       - name: Install pnpm
         run: npm install -g pnpm
 
-      - name: pnpm install + build frontend
-        working-directory: easytier-web/frontend-lib
+      # ─── 安装前端依赖并构建 ───
+      - name: Install frontend dependencies
         run: |
-          pnpm install --registry=https://registry.npmmirror.com
-          pnpm build
+          pnpm config set registry https://registry.npmmirror.com
+          pnpm install --prefer-offline
+
+      - name: Build frontend library
+        working-directory: easytier-web/frontend-lib
+        run: pnpm build
 
       - name: Verify frontend build output
         run: |
-          echo "=== 检查 Config 关键词（确认高级设置/端口转发/剪贴板都在）==="
-          grep -r "advanced_settings\|port_forwards\|clipboard_sync\|edit-as-file\|import-config\|save-config" \
-            easytier-web/frontend-lib/dist/ 2>/dev/null | head -10 || echo "⚠️ 未找到关键关键词 - UI 可能不完整"
+          echo "=== 检查前端构建产物 ==="
+          ls -la easytier-web/frontend-lib/dist/ 2>/dev/null || echo "⚠️ dist 目录不存在"
+          echo "=== 检查关键关键词 ==="
+          grep -r "advanced_settings\|port_forwards\|clipboard_sync" \
+            easytier-web/frontend-lib/dist/ 2>/dev/null | head -5 || echo "⚠️ 未找到关键关键词"
 
-      - name: cargo build (aarch64)
+      # ─── 安装 Tauri CLI ───
+      - name: Install Tauri CLI
         run: |
-          # 加 swap 防 OOM
+          cargo install tauri-cli --version "^2" --locked 2>/dev/null || true
+
+      # ─── 添加 swap 防止 OOM ───
+      - name: Add swap space
+        run: |
           sudo fallocate -l 8G /swapfile 2>/dev/null || true
           sudo chmod 600 /swapfile 2>/dev/null || true
           sudo mkswap /swapfile 2>/dev/null || true
           sudo swapon /swapfile 2>/dev/null || true
-          cargo build -p easytier-gui --target aarch64-linux-android --release -j 2
+          free -h
 
-      - name: tauri android build
+      # ─── 构建 Android APK ───
+      - name: Build Android APK
         working-directory: easytier-gui
         run: |
-          cargo install tauri-cli --version "^2" --locked 2>/dev/null || true
-          cargo tauri android build ${{ github.event.inputs.build_type == 'release' && '--release' || '' }}
+          if [ "${{ github.event.inputs.build_type }}" = "release" ]; then
+            cargo tauri android build --release
+          else
+            cargo tauri android build --apk
+          fi
 
-      - name: Find & upload APK
+      # ─── 查找并上传 APK ───
+      - name: Find APK
+        id: find_apk
         run: |
           APK=$(find easytier-gui/gen/android/app/build/outputs/apk -name "*.apk" 2>/dev/null | head -1)
-          [ -z "$APK" ] && { echo "❌ 未找到 APK"; ls -la easytier-gui/gen/android/app/build/outputs/ 2>/dev/null || true; exit 1; }
+          if [ -z "$APK" ]; then
+            echo "❌ 未找到 APK 文件"
+            echo "=== 输出目录内容 ==="
+            find easytier-gui/gen/android/app/build/ -type f 2>/dev/null | head -30
+            exit 1
+          fi
           echo "✅ 找到 APK: $APK"
           cp "$APK" /tmp/easytier-transfer.apk
           ls -lh /tmp/easytier-transfer.apk
+          echo "apk_path=$APK" >> $GITHUB_OUTPUT
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
         with:
           name: easytier-transfer-android-${{ github.event.inputs.build_type || 'debug' }}
           path: /tmp/easytier-transfer.apk
           retention-days: 30
 
-      - name: Summary
+      # ─── 构建摘要 ───
+      - name: Build Summary
         if: always()
         run: |
           echo "## 📱 EasyTier Transfer Android" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "- **包名**: com.easyshare.easytier" >> $GITHUB_STEP_SUMMARY
           echo "- **版本**: v2.6.4" >> $GITHUB_STEP_SUMMARY
+          echo "- **构建类型**: ${{ github.event.inputs.build_type || 'debug' }}" >> $GITHUB_STEP_SUMMARY
           echo "- **提交**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
-          [ -f /tmp/easytier-transfer.apk ] && echo "- **APK**: ✅ $(du -h /tmp/easytier-transfer.apk | cut -f1)" >> $GITHUB_STEP_SUMMARY || echo "- **APK**: ❌ 未生成" >> $GITHUB_STEP_SUMMARY
+          echo "- **时间**: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S CST')" >> $GITHUB_STEP_SUMMARY
+          if [ -f /tmp/easytier-transfer.apk ]; then
+            echo "- **APK**: ✅ $(du -h /tmp/easytier-transfer.apk | cut -f1)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **APK**: ❌ 未生成" >> $GITHUB_STEP_SUMMARY
+          fi
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### 🔧 排查提示" >> $GITHUB_STEP_SUMMARY
           echo "- 如果 UI 选项缺失，检查 'Verify frontend build output' 步骤" >> $GITHUB_STEP_SUMMARY
-          echo "- 如果 OOM，检查 'cargo build' 步骤的 swap 是否生效" >> $GITHUB_STEP_SUMMARY
-          echo "- 如果 sdkmanager 找不到，检查 'Setup Android SDK' 步骤的 PATH 设置" >> $GITHUB_STEP_SUMMARY
+          echo "- 如果 OOM，检查 swap 空间是否生效" >> $GITHUB_STEP_SUMMARY
+          echo "- 如果 sdkmanager 找不到，检查 'Setup Android SDK' 步骤" >> $GITHUB_STEP_SUMMARY
+          echo "- 查看 Actions 日志获取详细错误信息" >> $GITHUB_STEP_SUMMARY
