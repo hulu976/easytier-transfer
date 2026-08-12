@@ -8,153 +8,99 @@ on:
         required: true
         default: 'debug'
         type: choice
-        options:
-          - debug
-          - release
+        options: [debug, release]
   push:
-    branches: [main, master]
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  ANDROID_HOME: /opt/android-sdk
+  ANDROID_SDK_ROOT: /opt/android-sdk
+  NDK_VERSION: "25.2.9519653"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
-    env:
-      ANDROID_HOME: /opt/android-sdk
-      ANDROID_SDK_ROOT: /opt/android-sdk
-      NDK_VERSION: "25.2.9519653"
-      JAVA_HOME: /usr/lib/jvm/temurin-17-jdk-amd64
-
+    timeout-minutes: 90
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
 
-      - name: Install system dependencies
+      - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libgtk-3-dev \
-            libsoup-3.0-dev \
-            libjavascriptcoregtk-4.1-dev \
-            pkg-config \
-            wget \
-            unzip \
-            openjdk-17-jdk
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libsdl2-dev \
+            pkg-config curl wget unzip openjdk-17-jdk-headless
 
-      - name: Setup Android SDK
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Setup Android SDK + NDK
         run: |
-          mkdir -p $ANDROID_HOME
-          cd $ANDROID_HOME
+          set -eux
+          SDK=/opt/android-sdk
+          mkdir -p "$SDK/cmdline-tools" && cd /tmp
           wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O cmdtools.zip
-          mkdir -p cmdline-tools/latest
-          unzip -q cmdtools.zip -d cmdline-tools/latest
-          rm cmdtools.zip
-          export PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$PATH
+          unzip -q cmdtools.zip -d "$SDK/cmdline-tools"
+          mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
+          echo "$SDK/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$SDK/platform-tools" >> $GITHUB_PATH
+          echo "ANDROID_HOME=$SDK" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$SDK" >> $GITHUB_ENV
+          which sdkmanager && sdkmanager --version
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;${{ env.NDK_VERSION }}"
+          echo "ANDROID_NDK_HOME=$SDK/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
+          echo "$SDK/ndk/${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-      - name: Setup Android NDK
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+
+      - run: npm install -g pnpm
+
+      - name: pnpm install + build frontend
+        working-directory: easytier-web/frontend-lib
         run: |
-          cd $ANDROID_HOME
-          wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip -O ndk.zip
-          unzip -q ndk.zip
-          mv android-ndk-r25c ndk
-          rm ndk.zip
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk" >> $GITHUB_ENV
+          pnpm install --registry=https://registry.npmmirror.com
+          pnpm build
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.75"
-          targets: |
-            aarch64-linux-android
-            armv7-linux-androideabi
-            x86_64-linux-android
-            i686-linux-android
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: latest
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "easytier-gui/src-tauri"
-          cache-on-failure: true
-
-      - name: Cache Gradle
-        uses: gradle/gradle-build-action@v3
-        with:
-          gradle-version: "8.5"
-
-      - name: Install npm dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Build frontend
-        run: pnpm -F easytier-web build
-
-      - name: Verify frontend build output
+      - name: Verify frontend
         run: |
-          echo "=== Checking frontend dist ==="
-          ls -la easytier-web/frontend-lib/dist/ 2>/dev/null || echo "NO DIST DIR"
-          echo ""
-          echo "=== Checking for Config.vue compiled output ==="
-          grep -l "advanced_settings\|port_forwards\|clipboard_sync" easytier-web/frontend-lib/dist/*.js 2>/dev/null || echo "WARNING: Config keywords not found in dist!"
+          echo "=== 检查 Config 关键词 ==="
+          grep -r "advanced_settings\|port_forwards\|clipboard_sync" \
+            easytier-web/frontend-lib/dist/ 2>/dev/null | head -5 || echo "⚠️ 未找到"
 
-      - name: Build Android APK (debug)
-        if: github.event.inputs.build_type != 'release'
-        working-directory: easytier-gui/src-tauri
+      - name: cargo build (aarch64)
+        run: cargo build -p easytier-gui --target aarch64-linux-android --release
+
+      - name: tauri android build
+        working-directory: easytier-gui
         run: |
-          export ANDROID_HOME=$ANDROID_HOME
-          export ANDROID_NDK_HOME=$ANDROID_NDK_HOME
-          export NDK_HOME=$ANDROID_NDK_HOME
-          pnpm tauri android build --apk --debug
+          cargo install tauri-cli --version "^2" --locked 2>/dev/null || true
+          cargo tauri android build ${{ github.event.inputs.build_type == 'release' && '--release' || '' }}
 
-      - name: Build Android APK (release)
-        if: github.event.inputs.build_type == 'release'
-        working-directory: easytier-gui/src-tauri
+      - name: Find & upload APK
         run: |
-          export ANDROID_HOME=$ANDROID_HOME
-          export ANDROID_NDK_HOME=$ANDROID_NDK_HOME
-          export NDK_HOME=$ANDROID_NDK_HOME
-          pnpm tauri android build --apk
+          APK=$(find easytier-gui/gen/android/app/build/outputs/apk -name "*.apk" 2>/dev/null | head -1)
+          [ -z "$APK" ] && { echo "❌ 未找到 APK"; exit 1; }
+          echo "✅ $APK"; cp "$APK" /tmp/easytier-transfer.apk
 
-      - name: Find and list APK files
-        run: |
-          echo "=== APK files found ==="
-          find . -name "*.apk" -type f 2>/dev/null
-          echo ""
-          echo "=== APK sizes ==="
-          find . -name "*.apk" -type f -exec ls -lh {} \; 2>/dev/null
-
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: easytier-transfer-android-${{ github.event.inputs.build_type || 'debug' }}
-          path: |
-            easytier-gui/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
-            easytier-gui/src-tauri/gen/android/apk/**/*.apk
+          path: /tmp/easytier-transfer.apk
           retention-days: 30
 
-      - name: Build summary
+      - name: Summary
         if: always()
         run: |
-          echo "## 📱 Build Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Build type**: ${{ github.event.inputs.build_type || 'debug' }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Package ID**: com.easyshare.easytier" >> $GITHUB_STEP_SUMMARY
-          echo "- **EasyTier version**: v2.6.4" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### APK files:" >> $GITHUB_STEP_SUMMARY
-          find . -name "*.apk" -type f 2>/dev/null | while read f; do
-            size=$(ls -lh "$f" | awk '{print $5}')
-            echo "- \`$f\` ($size)" >> $GITHUB_STEP_SUMMARY
-          done
+          echo "## 📱 EasyTier Transfer Android" >> $GITHUB_STEP_SUMMARY
+          echo "- **包名**: com.easyshare.easytier" >> $GITHUB_STEP_SUMMARY
+          echo "- **版本**: v2.6.4" >> $GITHUB_STEP_SUMMARY
+          echo "- **提交**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          [ -f /tmp/easytier-transfer.apk ] && echo "- **APK**: ✅ $(du -h /tmp/easytier-transfer.apk | cut -f1)" >> $GITHUB_STEP_SUMMARY || echo "- **APK**: ❌ 未生成" >> $GITHUB_STEP_SUMMARY
