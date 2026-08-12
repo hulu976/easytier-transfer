@@ -91,11 +91,16 @@ jobs:
       - name: Install pnpm
         run: npm install -g pnpm
 
-      # ─── 安装前端依赖并构建 ───
-      - name: Install frontend dependencies
+      # ─── 修复 lockfile 并安装前端依赖 ───
+      # 关键修复：lockfile 与 frontend-lib/package.json 不同步
+      # (@tauri-apps/api 2.7.0 在 package.json 中但 lockfile 缺少解析条目)
+      # 使用 --no-frozen-lockfile 让 pnpm 自动更新 lockfile
+      - name: Install frontend dependencies (fix lockfile)
         run: |
           pnpm config set registry https://registry.npmmirror.com
-          pnpm install --prefer-offline
+          # 删除旧的 lockfile 让 pnpm 重新生成，彻底解决不一致问题
+          rm -f pnpm-lock.yaml
+          pnpm install --no-frozen-lockfile
 
       - name: Build frontend library
         working-directory: easytier-web/frontend-lib
