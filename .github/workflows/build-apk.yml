@@ -206,7 +206,7 @@ jobs:
       # ──────────────────────────────────────
       - name: Build Android APK
         env:
-          BINDGEN_EXTRA_CLANG_ARGS: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
+          BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-linux-gnu -I/usr/include -I/usr/include/x86_64-linux-gnu"
         run: |
           cd easytier-gui
           # 先单独跑 vue-tsc 类型检查，出错时给出清晰日志
