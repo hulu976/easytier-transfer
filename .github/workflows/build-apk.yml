@@ -177,6 +177,18 @@ jobs:
           cargo tauri info || true
 
       # ──────────────────────────────────────
+      # protoc（Protocol Buffers 编译器）
+      # Rust 依赖链中的 prost-wkt-types 在构建期需要 protoc，
+      # GitHub runner 默认未安装，必须显式安装，否则会报
+      # "Could not find `protoc`" 而导致 cargo build 失败
+      # ──────────────────────────────────────
+      - name: Install protobuf compiler (protoc)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
+
+      # ──────────────────────────────────────
       # 构建 APK
       # ──────────────────────────────────────
       - name: Build Android APK
